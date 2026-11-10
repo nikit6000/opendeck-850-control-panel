@@ -1,0 +1,5 @@
+firmware/target/
+firmware/*.bin
+__pycache__/
+*.npy
+.DS_Store
