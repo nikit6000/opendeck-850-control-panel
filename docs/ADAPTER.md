@@ -1,5 +1,17 @@
 # STM32F401 adapter: stands in for the MAIN board on the CDJ-850 panel bus
 
+**2026-11-16: standalone HID mode.** The adapter now does the whole MAIN job for the panel by itself and shows up on
+USB as the CDJ-850's own PC-mode HID device (08E4:0157, 20-byte input, 36-byte output, no report IDs) plus the
+STM32 extensions (input byte 5: BROWSE / TAG LIST / INFO / MENU / USB STOP / PC / USB / DISC; output bytes 24–29:
+jog cue mark, jog ring, position bar, cue dot, track-end, source lamps). Spec: `buildroot/docs/PANEL-HID.md`;
+codec: `firmware/src/panel.rs`. A host needs no adapter protocol any more: any program that drives a CDJ-850 in
+PC mode (`cdj850-panel-bridge` on the CM5, `mac-hid/*.py`, pi-player `--panel hid`) works with it.
+- It is MAIN from reset (SLAVE mode), so the MAIN_XBUSY handshake runs without a host: high from reset, low 2.8 s
+  after PWR_ON. If the panel then does not clock within 1 s, the handshake is repeated (up to 3 times per PWR_ON).
+- The CDC port is still there (composite device) with the raw bus records and the commands below, for
+  `host/sniff.py` and friends. Records go out only while the port is open.
+- Not yet checked on hardware (the earlier CDC-only firmware was).
+
 **Works (checked 2026-11-10):** MAIN unplugged, the panel exchanges frames with the adapter just as it does with the native MAIN.
 - The panel frames arrive: buttons, jog, fader. The panel acknowledges our screen frame (byte 9) and echoes our heartbeat (byte 11).
 - With a host player program, a button press goes to the host and the lamp comes back.
@@ -41,8 +53,8 @@ Everything goes **through 1 kΩ in series**.
 
 | mode | what the adapter does | when |
 |---|---|---|
-| 0 LISTEN (default after reset) | only listens: both SPIs are receivers, B1/B14 are not driven | native MAIN is connected, sniffing |
-| **2 SLAVE** | stands in for MAIN: MAIN_XBUSY handshake, answers each panel frame on B14 | **working mode** without MAIN |
+| 0 LISTEN | only listens: both SPIs are receivers, B1/B14 are not driven; the HID input still follows the panel | native MAIN is connected, sniffing |
+| **2 SLAVE** (default after reset) | stands in for MAIN: MAIN_XBUSY handshake, answers each panel frame on B14 | **working mode** without MAIN |
 | 1 MASTER | drives TSCK itself (SPI1 master, 1.3125 MHz) and waits on PNL_XBUSY | not needed for the CDJ-850 panel (it clocks itself); kept for experiments |
 
 A repeated command with the same mode does not restart the handshake. Switching modes does.
@@ -57,10 +69,11 @@ cd firmware
 
 - With an ST-Link V2 clone on macOS, st-flash and openocd hung (libusb); probe-rs works fine.
 - The chip is not detected automatically; flash.sh passes `--chip STM32F401CCUx`.
-- After a reset the board shows up as `/dev/cu.usbmodem*` (USB 1209:0850, "CDJ-850 panel bus adapter").
 - The crystal is assumed to be **25 MHz** (Black Pill).
-- After flashing, the adapter comes up in LISTEN. The panel will hit E-8709 until the host sets SLAVE mode and the player is power-cycled.
-  - Exception: if PWR_ON is already high, the handshake runs immediately when SLAVE is set, and the panel picks up without a power cycle.
+- After a reset the board shows up as the HID "CDJ-850 panel (STM32)" plus `/dev/cu.usbmodem*` (USB 08E4:0157).
+- After flashing, the adapter comes up in SLAVE (it is MAIN): MAIN_XBUSY high, then low 2.8 s after PWR_ON. If PWR_ON
+  is already high, it counts from the reset. The earlier firmware came up in LISTEN, which left the panel at
+  E-8709 until a host set SLAVE and the player was power-cycled.
 
 ## Use
 
@@ -83,7 +96,7 @@ Device → host, 44-byte record per bus frame:
 Host → device: `A5 5A | cmd | len | payload`:
 | cmd | len | meaning |
 |---|---|---|
-| 0x01 | 32 | MAIN frames 0x01 and 0x02 (byte 15 is ignored; the checksum is computed by the adapter) |
+| 0x01 | 32 | MAIN frames 0x01 and 0x02 (byte 15 is ignored; the checksum is computed by the adapter); a raw override until the next HID output report |
 | 0x02 | 16·k | other frames in send order (80, 81…, 70…); 0x60 is added if missing |
 | 0x03 | 1 | mode 0 / 1 / 2 (see above) |
 
@@ -97,4 +110,13 @@ Host → device: `A5 5A | cmd | len | payload`:
   - hands the frame to USB;
   - resets the slave SPIs (bit alignment starts fresh);
   - loads the next answer. There are ~600 µs left before the next frame.
-- **TIM3** runs at 10 µs: the MAIN_XBUSY handshake from PWR_ON, and the MASTER-mode scheduler.
+- **TIM3** runs at 10 µs: the MAIN_XBUSY handshake from PWR_ON (and its watchdog), and the MASTER-mode scheduler.
+- The main loop polls USB, turns each HID output report into frames 01/02 (`panel::encode`), feeds the latest panel
+  frames 01/02 to `panel::Decoder` and sends the input report when it changes (1 ms interrupt endpoint), so a jog
+  move reaches the host within ~2–3 ms (panel frame 01 every ~2.3 ms + one USB frame).
+
+## Design notes for the new mainboard (CM5)
+- Pull MAIN_XBUSY **up** (e.g. 10 kΩ to 3.3 V) on the board, so the panel sees "busy" while the STM32 is in reset
+  or not yet flashed; the firmware then drives it. A low or floating line at power-on is what gives E-8709.
+- Power the STM32 from the player's own rail (with PWR_ON), not from the CM5's USB VBUS alone: it must be up
+  and driving MAIN_XBUSY when the panel starts.

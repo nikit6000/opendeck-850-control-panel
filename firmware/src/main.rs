@@ -1,36 +1,40 @@
-//! CDJ-850 panel-bus adapter for STM32F401 ("Black Pill", 25 MHz HSE): plays the MAIN board.
+//! CDJ-850 panel-bus adapter for STM32F401 ("Black Pill", 25 MHz HSE): takes the MAIN board's place
+//! on the panel bus and presents the panel to the host as the CDJ-850's own PC-mode USB HID device
+//! (08E4:0157, 20-byte input / 36-byte output, no report IDs) plus the STM32 extensions of
+//! `buildroot/docs/PANEL-HID.md`. A CDC port next to it keeps the raw bus records for debugging.
 //!
-//! Bus (PROTOCOL.md): SPI mode 3, LSB first, 16-byte full-duplex frames, ~1.3 MHz clock.
-//! **MAIN is the clock master** (captures/disc_check: the panel raises PNL_XBUSY 4 µs after a frame
-//! and MAIN starts the next clock burst 64 µs after PNL_XBUSY falls; with MAIN unplugged the bus
-//! never starts and the panel shows E-8709). MAIN sends TSO, the panel answers on TSI.
+//! Bus (docs/PROTOCOL.md): SPI mode 3, LSB first, 16-byte full-duplex frames every ~0.755 ms, ~1.3 MHz.
+//! **The panel is the clock master**; MAIN answers on TSO. The panel starts clocking only after the
+//! MAIN_XBUSY handshake: high ("booting") after PWR_ON, then low ("ready"). Without it: E-8709.
 //!
 //! Pins (each through 1 kΩ to CN2007):
-//! - PA5 = TSCK, PA7 = TSO: SPI1. MASTER mode: SPI1 is the master and drives both (clock /64 =
-//!   1.3125 MHz, TX by DMA2 S3 ch3). LISTEN mode: SPI1 is an RX-only slave (DMA2 S0 ch3) = sniffer.
-//! - PB13 ← TSCK, PB15 ← TSI: SPI2 RX-only slave (DMA1 S3 ch0) in both modes — the panel's answer.
+//! - PB13 ← TSCK, PB15 ← TSI, PB14 → TSO: SPI2 slave. RX by DMA1 S3 ch0, TX (SLAVE mode) by DMA1 S4 ch0.
+//! - PA5 ← TSCK, PA7 ← TSO: SPI1 RX-only slave (DMA2 S0 ch3) = read-back of the TSO line. MASTER
+//!   mode (experiments only): SPI1 drives TSCK + TSO itself (clock /64 = 1.3125 MHz, TX by DMA2 S3 ch3).
 //! - PA15 ← TSCK: TIM2 CH1, slave reset mode; CC2 fires after GAP_US of clock silence = frame end.
-//!   The ISR hands the frame to USB, resets the slave SPIs (bit realignment), loads the next answer.
-//! - PB0 ← PNL_XBUSY (MASTER waits while it is high).
-//! - PB1 = MAIN_XBUSY: MASTER / SLAVE drive it high ("busy") until BOOT_DELAY_US after PWR_ON,
-//!   then low ("ready", as in every native capture); LISTEN: input.
-//! - PA1 ← PWR_ON (CN2007 pin 9): MASTER starts clocking BOOT_DELAY_US after it goes high.
-//! - PB14 is not used (input, Hi-Z). PC13 LED blinks while frames flow.
+//!   The ISR stores the frame, resets the slave SPIs (bit realignment) and loads the next answer.
+//! - PB0 ← PNL_XBUSY (logged; MASTER waits while it is high).
+//! - PB1 = MAIN_XBUSY: high from reset and until BOOT_DELAY_US after PWR_ON, then low. If the panel
+//!   then does not clock for BUS_WATCHDOG_US, the handshake is repeated (up to HANDSHAKE_RETRIES times
+//!   per PWR_ON) — the case of a panel that missed it (adapter started late, glitch).
+//! - PA1 ← PWR_ON (CN2007 pin 9).
+//! - PC13 LED blinks while frames flow.
 //!
-//! MASTER schedule (TIM3 tick every 10 µs): start a frame when ≥ MIN_GAP_US passed since the last one
-//! ended and PNL_XBUSY has been low for ≥ XBUSY_SETTLE_US. Frames, like the native MAIN: slots
-//! `02, x, x, 01, x, x` repeating, x walking through the "others" list (default = idle screen 80, 81,
-//! 82, 60). 0x60 is the heartbeat, generated here (byte 1 = +1 every 20 ms); checksums are computed
-//! here. Until the host sends anything, the frames are the native MAIN's idle frames (disc_check).
+//! Frames to the panel, like the native MAIN: slots `02, x, x, 01, x, x`, x walking through the
+//! "others" (default: a blank track screen 80, 81, 82, plus the 60 heartbeat, +1 every 20 ms).
+//! Frames 01 / 02 come from the HID output report (panel.rs); checksums are computed here.
 //!
-//! USB CDC, device → host, 44-byte record per bus frame (little-endian):
+//! Modes: 2 SLAVE (default from reset: we are MAIN), 0 LISTEN (sniffer next to a native MAIN; HID input
+//! still works), 1 MASTER (we clock; not needed for the CDJ-850 panel).
+//!
+//! USB: one composite device 08E4:0157. Interface 0 = HID (panel.rs / hid.rs). Interfaces 1+2 = CDC,
+//! device → host, 44-byte record per bus frame (little-endian), only while the port is open (DTR):
 //!   A5 5A | seq u16 | t_us u32 | n_tso u8 | n_tsi u8 | flags u8 | dropped u8 | TSO[16] | TSI[16]
 //!   flags: bit0 PNL_XBUSY, bit1 MAIN_XBUSY, bit2 MASTER mode, bit3 PWR_ON, bit4 SLAVE. In MASTER, TSO = what we sent.
 //! Host → device commands: A5 5A | cmd u8 | len u8 | payload[len]
-//!   0x01 len 32: frames 0x01 and 0x02 (16 B each; byte 15 ignored)
+//!   0x01 len 32: frames 0x01 and 0x02 (16 B each; byte 15 ignored) — raw override until the next HID output
 //!   0x02 len 16·k (k = 1..15): "others" list in send order; 0x60 is added automatically if missing
-//!   0x03 len 1: mode, 0 = LISTEN (sniffer, native MAIN connected), 1 = MASTER (we clock the bus),
-//!               2 = SLAVE (the panel clocks, we answer on PB14 → TSO and hold MAIN_XBUSY low)
+//!   0x03 len 1: mode 0 / 1 / 2 (see above)
 #![no_std]
 #![no_main]
 
@@ -41,6 +45,10 @@ use cortex_m_rt::entry;
 use critical_section::Mutex;
 use heapless::{Deque, Vec};
 use panic_halt as _;
+
+mod hid;
+mod panel;
+use panel::checksum;
 use stm32f4xx_hal::{
     otg_fs::{UsbBus, USB},
     pac::{self, interrupt, Interrupt},
@@ -61,6 +69,11 @@ const XFER_TIMEOUT_US: u32 = 2000;
 /// MASTER starts clocking this long after PWR_ON (PA1) goes high — the native MAIN boots ~2.8 s
 /// before its first frame; clocking a panel that is still starting misaligns its SPI for good.
 const BOOT_DELAY_US: u32 = 2_800_000;
+/// SLAVE: no frame for this long after the handshake (or since the last frame) → handshake again.
+const BUS_WATCHDOG_US: u32 = 1_000_000;
+const HANDSHAKE_RETRIES: u8 = 3;
+/// HID input reports go out on change, and at least this often (the host may open the device late).
+const HID_KEEPALIVE_MS: u32 = 250;
 
 static mut RX_TSO: [u8; BUF] = [0; BUF];
 static mut RX_TSI: [u8; BUF] = [0; BUF];
@@ -69,12 +82,6 @@ static mut EP_MEMORY: [u32; 1024] = [0; 1024];
 
 type F = [u8; 16];
 
-/// Idle frames of the native MAIN with no media (captures/disc_check), checksums recomputed.
-const IDLE_01: F = [0x01, 0x00, 0x58, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0];
-const IDLE_02: F = [0x02, 0x00, 0x58, 0, 0, 0x60, 0x22, 0x1F, 0, 0, 0, 0x04, 0x51, 0x2F, 0x4A, 0];
-const IDLE_80: F = [0x80, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0x02, 0, 0, 0];
-const IDLE_81: F = [0x81, 0x11, 0, 0, 0, 0, 0x12, 0, 0, 0, 0, 0x13, 0, 0, 0, 0];
-const IDLE_82: F = frame(0x82);
 const HEARTBEAT: F = frame(0x60);
 
 const fn frame(t: u8) -> F {
@@ -101,6 +108,14 @@ struct State {
     last_end: u32,
     xbusy_low_since: Option<u32>,
     pwr_on_since: Option<u32>,
+    // SLAVE handshake watchdog
+    last_frame_us: u32,
+    retries: u8,
+    handshakes: u16,
+    // latest panel frames for the HID decoder (bit0 = new 0x01, bit1 = new 0x02)
+    tsi01: F,
+    tsi02: F,
+    tsi_new: u8,
 }
 
 static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
@@ -110,8 +125,8 @@ static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
     frames: 0,
     master: false,
     slave_tx: false,
-    f01: IDLE_01,
-    f02: IDLE_02,
+    f01: frame(0x01),
+    f02: frame(0x02),
     others: Vec::new(),
     slot: 0,
     other_i: 0,
@@ -120,19 +135,13 @@ static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
     last_end: 0,
     xbusy_low_since: None,
     pwr_on_since: None,
+    last_frame_us: 0,
+    retries: 0,
+    handshakes: 0,
+    tsi01: [0; 16],
+    tsi02: [0; 16],
+    tsi_new: 0,
 }));
-
-/// 8-bit one's-complement sum (end-around carry), as MAIN fw 0x0C0F9EE8.
-fn checksum(b: &[u8]) -> u8 {
-    let mut s: u32 = 0;
-    for &x in b {
-        s += x as u32;
-        if s > 0xFF {
-            s = (s & 0xFF) + 1;
-        }
-    }
-    s as u8
-}
 
 impl State {
     /// Next frame to send (checksum filled in).
@@ -221,11 +230,18 @@ fn main() -> ! {
 
     critical_section::with(|cs| {
         let mut st = STATE.borrow_ref_mut(cs);
-        let mut idle = [0u8; 48];
-        idle[..16].copy_from_slice(&IDLE_80);
-        idle[16..32].copy_from_slice(&IDLE_81);
-        idle[32..].copy_from_slice(&IDLE_82);
-        st.set_others(&idle);
+        // until the host sends lamps: everything dark, numbers blank
+        let mut o = [0u8; panel::OUT_LEN];
+        o[0] = 0x01;
+        if let Some((a, b)) = panel::encode(&o) {
+            st.f01 = a;
+            st.f02 = b;
+        }
+        let mut scr = [0u8; 48];
+        for (i, f) in panel::blank_screen(1).iter().enumerate() {
+            scr[16 * i..16 * i + 16].copy_from_slice(f);
+        }
+        st.set_others(&scr);
     });
 
     // TIM5: free-running 1 MHz timestamp
@@ -235,7 +251,7 @@ fn main() -> ! {
     t5.egr().write(|w| unsafe { w.bits(1) });
     t5.cr1().write(|w| unsafe { w.bits(1) });
 
-    set_mode(0);
+    set_mode(2); // we are MAIN from reset: MAIN_XBUSY high now, low BOOT_DELAY after PWR_ON
 
     // TIM2: gap detector (frame end)
     let t2 = unsafe { &*pac::TIM2::ptr() };
@@ -268,29 +284,75 @@ fn main() -> ! {
         NVIC::unmask(Interrupt::TIM3);
     }
 
-    // USB CDC
+    // USB: HID (panel) + CDC (raw bus records, commands)
     let usb = USB::new(
         (dp.OTG_FS_GLOBAL, dp.OTG_FS_DEVICE, dp.OTG_FS_PWRCLK),
         (gpioa.pa11, gpioa.pa12),
         &rcc.clocks,
     );
     let bus = UsbBus::new(usb, unsafe { &mut *core::ptr::addr_of_mut!(EP_MEMORY) });
-    let mut serial = SerialPort::new(&bus);
-    let mut dev = UsbDeviceBuilder::new(&bus, UsbVidPid(0x1209, 0x0850))
+    let mut hid = hid::Hid::new(&bus); // interface 0
+    let mut serial = SerialPort::new(&bus); // interfaces 1, 2
+    let mut dev = UsbDeviceBuilder::new(&bus, UsbVidPid(0x08E4, 0x0157))
+        .composite_with_iads()
         .strings(&[StringDescriptors::default()
             .manufacturer("cdj850")
-            .product("CDJ-850 panel bus adapter")
-            .serial_number("0003")])
+            .product("CDJ-850 panel (STM32)")
+            .serial_number("0004")])
         .unwrap()
-        .device_class(usbd_serial::USB_CLASS_CDC)
+        .max_packet_size_0(64)
+        .unwrap()
         .build();
 
+    let mut dec = panel::Decoder::new();
+    let mut last_report = [0u8; panel::IN_LEN];
+    let mut last_report_ms = 0u32;
+    let mut ms = 0u32;
+    let mut ms_us = now_us();
     let mut out = [0u8; REC];
     let mut pos = REC;
     let mut last_blink = 0u32;
     let mut cmd: Vec<u8, 300> = Vec::new();
     loop {
-        dev.poll(&mut [&mut serial]);
+        dev.poll(&mut [&mut hid, &mut serial]);
+
+        // millisecond clock for debounce / keepalive (TIM5 wraps every 71 min)
+        let t = now_us();
+        let dt = t.wrapping_sub(ms_us) / 1000;
+        ms = ms.wrapping_add(dt);
+        ms_us = ms_us.wrapping_add(dt * 1000);
+
+        // HID output → frames 01 / 02
+        if let Some(o) = hid.take_output() {
+            if let Some((a, b)) = panel::encode(&o) {
+                critical_section::with(|cs| {
+                    let mut st = STATE.borrow_ref_mut(cs);
+                    st.f01 = a;
+                    st.f02 = b;
+                });
+            }
+        }
+        // panel frames → HID input
+        let (new, f1, f2) = critical_section::with(|cs| {
+            let mut st = STATE.borrow_ref_mut(cs);
+            let n = st.tsi_new;
+            st.tsi_new = 0;
+            (n, st.tsi01, st.tsi02)
+        });
+        if new & 1 != 0 {
+            dec.feed(&f1, ms);
+        }
+        if new & 2 != 0 {
+            dec.feed(&f2, ms);
+        }
+        dec.settle(ms);
+        if dev.state() == UsbDeviceState::Configured {
+            let r = dec.report();
+            if (r != last_report || ms.wrapping_sub(last_report_ms) >= HID_KEEPALIVE_MS) && hid.send(&r) {
+                last_report = r;
+                last_report_ms = ms;
+            }
+        }
 
         // host → device
         let mut rx = [0u8; 64];
@@ -315,9 +377,12 @@ fn main() -> ! {
 
         // device → host
         if pos == REC {
+            let open = serial.dtr();
             if let Some(rec) = critical_section::with(|cs| STATE.borrow_ref_mut(cs).q.pop_front()) {
-                out = rec;
-                pos = 0;
+                if open {
+                    out = rec;
+                    pos = 0;
+                }
             }
         }
         if pos < REC {
@@ -392,6 +457,7 @@ fn set_mode(mode: u8) {
         let gb = unsafe { &*pac::GPIOB::ptr() };
         gb.bsrr().write(|w| unsafe { w.bits(1 << 1) }); // ODR1 = 1 (busy) until TIM3 says ready
         st.pwr_on_since = None;
+        st.retries = 0;
         gb.afrh().modify(|v, w| unsafe { w.bits((v.bits() & !(0xF << 24)) | (5 << 24)) });
         gb.moder().modify(|v, w| unsafe {
             let m = (v.bits() & !(0b11 << 2) & !(0b11 << 28))
@@ -508,16 +574,34 @@ fn TIM3() {
         let gb = unsafe { &*pac::GPIOB::ptr() };
         if !pwr_on() {
             st.pwr_on_since = None;
+            st.retries = 0;
             st.slot = 0;
             gb.bsrr().write(|w| unsafe { w.bits(1 << 1) });
             return;
         }
-        let since = *st.pwr_on_since.get_or_insert(now);
-        if now.wrapping_sub(since) < BOOT_DELAY_US {
+        if st.pwr_on_since.is_none() {
+            st.pwr_on_since = Some(now);
+            st.handshakes = st.handshakes.wrapping_add(1);
+        }
+        let since = st.pwr_on_since.unwrap_or(now);
+        let up = now.wrapping_sub(since);
+        if up < BOOT_DELAY_US {
             gb.bsrr().write(|w| unsafe { w.bits(1 << 1) });
+            st.last_frame_us = now;
             return;
         }
         gb.bsrr().write(|w| unsafe { w.bits(1 << (16 + 1)) });
+        // the panel did not start (or stopped) clocking after "ready": run the handshake again
+        if st.slave_tx
+            && now.wrapping_sub(st.last_frame_us) > BUS_WATCHDOG_US
+            && st.retries < HANDSHAKE_RETRIES
+        {
+            st.retries += 1;
+            st.pwr_on_since = None;
+            st.slot = 0;
+            gb.bsrr().write(|w| unsafe { w.bits(1 << 1) });
+            return;
+        }
         if !st.master {
             return;
         }
@@ -587,6 +671,21 @@ fn TIM2() {
         }
         st.in_xfer = false;
         st.last_end = t;
+        st.last_frame_us = t;
+        if n_tsi == 16 {
+            let tsi: F = unsafe { (&*core::ptr::addr_of!(RX_TSI))[..16].try_into().unwrap() };
+            match tsi[0] {
+                0x01 => {
+                    st.tsi01 = tsi;
+                    st.tsi_new |= 1;
+                }
+                0x02 => {
+                    st.tsi02 = tsi;
+                    st.tsi_new |= 2;
+                }
+                _ => {}
+            }
+        }
         let slave_tx = st.slave_tx;
         if slave_tx {
             let f = st.next_frame(t);

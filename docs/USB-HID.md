@@ -107,6 +107,18 @@ cd mac-hid   # tools not included in this repository
 .venv/bin/python leds.py on PLAY "AUTO LOOP 1" MT
 ```
 
+## The STM32 adapter's HID
+`firmware/` presents the same device (VID/PID, report descriptor byte for byte, 20/36-byte reports, 1 ms
+interrupt endpoints) as interface 0 of a composite device (CDC on 1–2), product string "CDJ-850 panel (STM32)".
+Differences from the stock MAIN, all in `firmware/src/panel.rs`:
+- input byte 5 = BROWSE 0x01, TAG LIST 0x02, INFO 0x04, MENU 0x08, USB STOP 0x10, PC 0x20, USB 0x40, DISC 0x80;
+- output bytes 24–29 (valid when byte 28 has 0x80): jog cue mark 0–84, jog ring 1–135 (0x88 off), position bar %,
+  cue dot %, byte 28 0x01 track-end blink, byte 29 source lamps (0x01 USB, 0x02 LINK, 0x04 DISC, 0x08 DISC EJECT,
+  0x10 USB source);
+- no MIDI or audio interfaces; output type 0x01 only;
+- the input report also goes out every 250 ms without a change;
+- jog counter = bus counter × 3 and jog speed approximate (see PANEL-HID.md).
+
 ## Worn pads (hardware, not protocol)
 TIME MODE (late/missed presses), DELETE (ghost MEMORY ~20 ms), BROWSE (ghost TAG LIST), INFO (ghost MENU), DISC EJECT.
 Ghosts show up here exactly as on the internal panel bus; debounce ≥ 60 ms in software.

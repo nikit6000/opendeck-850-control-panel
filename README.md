@@ -5,11 +5,13 @@ Running the **Pioneer CDJ-850 control panel without its MAIN board**. This repos
 - the wiring;
 - the firmware for a small STM32F401 adapter that takes MAIN's place on the bus.
 
-A host program (Mac, Raspberry Pi, …) talks to the adapter over USB.
-- From the panel it gets complete frames: buttons, jog, tempo fader, selector, knobs.
-- To the panel it sends lamps, segment display numbers, the jog ring and the cue mark, the position bar and text.
+The adapter shows up on USB as the CDJ-850's own PC-mode HID device (08E4:0157), with extensions for what the
+stock MAIN does not pass over HID (BROWSE / TAG LIST / INFO / MENU / USB STOP, jog cue mark and ring, position bar,
+source lamps; see `buildroot/docs/PANEL-HID.md`). Anything that drives a CDJ-850 in PC mode drives the bare panel
+through it. A CDC port next to the HID gives the raw bus frames for debugging and experiments.
 
-**Status (2026-11-10):** works on a real CDJ-850 with the MAIN board unplugged. Checked so far:
+**Status (2026-11-16):** HID firmware written, not yet checked on hardware. The earlier CDC-only firmware
+(host program drives frames) works on a real CDJ-850 with the MAIN board unplugged (2026-11-10). Checked then:
 - all buttons, the jog, the fader and every lamp and icon;
 - the 7-segment and dot-matrix display;
 - the jog ring and the cue mark;
@@ -20,9 +22,9 @@ A host program (Mac, Raspberry Pi, …) talks to the adapter over USB.
 |---|---|
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | the bus: physical layer, start handshake, frame formats, every known bit (captures + MAIN firmware RE + bit tests) |
 | [docs/ADAPTER.md](docs/ADAPTER.md) | the adapter: **wiring**, modes, USB protocol, flashing, how the firmware works |
-| [docs/USB-HID.md](docs/USB-HID.md) | the other route: the stock MAIN in PC/LINK mode as a USB HID + MIDI controller (report map) |
+| [docs/USB-HID.md](docs/USB-HID.md) | the HID report map: the stock MAIN in PC/LINK mode, which the adapter reproduces |
 | [firmware/](firmware/) | STM32F401 "Black Pill" firmware (Rust, no RTOS) |
-| [host/](host/) | Python tools: `sniff.py` (monitor / logger), `text.py` (display text), `sweep.py` `bits.py` `sweepall.py` `cuemark.py` `lightall.py` `sleepbit.py` `sleepgroups.py` (bit/byte probing) |
+| [host/](host/) | Python tools: `hidtest.py` (HID bench check: presses, jog counts per turn, lamps, ring), `sniff.py` (monitor / logger), `text.py` (display text), `sweep.py` `bits.py` `sweepall.py` `cuemark.py` `lightall.py` `sleepbit.py` `sleepgroups.py` (bit/byte probing) |
 | [tools/saleae/](tools/saleae/) | decoding Saleae Logic captures of the bus (`decode.py` → frames, `diff.py` → changes) |
 
 ## The bus in one paragraph
@@ -62,7 +64,9 @@ Panel → MAIN, button bits and the rest: see [docs/PROTOCOL.md](docs/PROTOCOL.m
 
 1. Flash the adapter: `firmware/flash.sh` (ST-Link + probe-rs) or `firmware/flash.sh dfu`.
 2. Wire it to CN2007 / MAIN_XBUSY as in [docs/ADAPTER.md](docs/ADAPTER.md). Use 1 kΩ in series on every line, never touch CN2007 pin 1 (+12 V), and unplug the MAIN board.
-3. `pip install pyserial numpy`, then `python3 host/sniff.py --slave`. The adapter now plays MAIN, and button presses show up in the terminal.
-4. `python3 host/text.py 1 "HELLO" "FROM" "THE HOST"` shows text on the dot-matrix screen.
+3. Switch the player on. The adapter plays MAIN by itself; the panel lights up without E-8709.
+4. Any CDJ-850 PC-mode HID tool now sees the panel, e.g. `mac-hid/monitor.py` (presses) and `mac-hid/leds.py all`.
+5. Raw frames: `pip install pyserial numpy`, then `python3 host/sniff.py --slave`.
+   `python3 host/text.py 1 "HELLO" "FROM" "THE HOST"` shows text on the dot-matrix screen.
 
 The Saleae captures and the MAIN firmware image mentioned in PROTOCOL.md are not included.
